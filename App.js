@@ -1,4 +1,5 @@
 // Real Implementation App.js - No Simulation, Real Wi-Fi Scanning
+// Enhanced Mobile App with Authentication - App.js
 import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
@@ -20,11 +21,21 @@ import NetInfo from '@react-native-community/netinfo';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import WifiManager from 'react-native-wifi-reborn';
 
-const API_BASE_URL = 'https://sanitapi.onrender.com/api'; // Your production API
+const API_BASE_URL = 'https://sanitapi-1.onrender.com/api';
 
 const App = () => {
+  // Authentication State
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [user, setUser] = useState(null);
+  const [token, setToken] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  // Login State
+  const [loginForm, setLoginForm] = useState({ email: '', password: '' });
+  const [isLoginLoading, setIsLoginLoading] = useState(false);
+
   // App State
-  const [mode, setMode] = useState('training');
+  const [mode, setMode] = useState('cleaner');
   const [isTracking, setIsTracking] = useState(false);
   const [currentLocation, setCurrentLocation] = useState(null);
   const [currentArea, setCurrentArea] = useState('Unknown');
@@ -54,7 +65,7 @@ const App = () => {
   const wifiScanInterval = useRef(null);
 
   useEffect(() => {
-    initializeApp();
+    checkAuthStatus();
     setupAppStateListener();
     
     return () => {
@@ -70,13 +81,133 @@ const App = () => {
     return () => unsubscribe();
   }, []);
 
+  useEffect(() => {
+    if (isAuthenticated && user) {
+      initializeApp();
+    }
+  }, [isAuthenticated, user]);
+
+  // ============================================================================
+  // AUTHENTICATION FUNCTIONS
+  // ============================================================================
+
+  const checkAuthStatus = async () => {
+    try {
+      const storedToken = await AsyncStorage.getItem('auth_token');
+      const storedUser = await AsyncStorage.getItem('user_data');
+
+      if (storedToken && storedUser) {
+        setToken(storedToken);
+        setUser(JSON.parse(storedUser));
+        setIsAuthenticated(true);
+        
+        // Set mode based on user role
+        const userData = JSON.parse(storedUser);
+        if (userData.role === 'admin') {
+          setMode('training'); // Admin defaults to training mode
+        } else {
+          setMode('cleaner'); // Cleaners can only use cleaner mode
+        }
+      }
+    } catch (error) {
+      console.error('Auth check error:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleLogin = async () => {
+    if (!loginForm.email || !loginForm.password) {
+      Alert.alert('Error', 'Please enter both email and password');
+      return;
+    }
+
+    setIsLoginLoading(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(loginForm),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        // Store auth data
+        await AsyncStorage.setItem('auth_token', data.token);
+        await AsyncStorage.setItem('user_data', JSON.stringify(data.user));
+
+        setToken(data.token);
+        setUser(data.user);
+        setIsAuthenticated(true);
+
+        // Set appropriate mode based on role
+        if (data.user.role === 'admin') {
+          setMode('training');
+        } else {
+          setMode('cleaner');
+        }
+
+        Alert.alert('Success', `Welcome back, ${data.user.name}!`);
+      } else {
+        Alert.alert('Login Failed', data.error || 'Invalid credentials');
+      }
+    } catch (error) {
+      console.error('Login error:', error);
+      Alert.alert('Error', 'Network error. Please check your connection.');
+    } finally {
+      setIsLoginLoading(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await AsyncStorage.multiRemove(['auth_token', 'user_data']);
+      setToken(null);
+      setUser(null);
+      setIsAuthenticated(false);
+      setIsTracking(false);
+      cleanup();
+      Alert.alert('Logged Out', 'You have been logged out successfully');
+    } catch (error) {
+      console.error('Logout error:', error);
+    }
+  };
+
+  const apiRequest = async (endpoint, options = {}) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+          ...options.headers,
+        },
+      });
+
+      if (response.status === 401) {
+        // Token expired or invalid
+        await handleLogout();
+        Alert.alert('Session Expired', 'Please log in again');
+        return null;
+      }
+
+      return response;
+    } catch (error) {
+      console.error('API request error:', error);
+      throw error;
+    }
+  };
+
+  // ============================================================================
+  // APP INITIALIZATION (Same as before but with auth)
+  // ============================================================================
+
   const setupAppStateListener = () => {
     const subscription = AppState.addEventListener('change', (nextAppState) => {
       if (nextAppState === 'background' && isTracking) {
-        // Continue tracking in background for cleaner mode
         console.log('App went to background, continuing location tracking');
       } else if (nextAppState === 'active') {
-        // Refresh when app comes back to foreground
         if (isTracking) {
           updateCurrentLocation();
         }
@@ -89,19 +220,10 @@ const App = () => {
   const initializeApp = async () => {
     try {
       setLoading(true);
-      
-      // Request all necessary permissions
       await requestAllPermissions();
-      
-      // Initialize sensors
       await startSensorMonitoring();
-      
-      // Get initial location
       await updateCurrentLocation();
-      
-      // Load stored data
       await loadStoredData();
-      
       console.log('App initialized successfully');
     } catch (error) {
       console.error('Initialization error:', error);
@@ -111,84 +233,77 @@ const App = () => {
     }
   };
 
- const requestAllPermissions = async () => {
-  try {
-    // Location permissions first
-    const { status: locationStatus } = await Location.requestForegroundPermissionsAsync();
-    if (locationStatus !== 'granted') {
-      throw new Error('Location permission denied');
-    }
-
-    // Background location for Android
-    if (Platform.OS === 'android') {
-      try {
-        const { status: backgroundStatus } = await Location.requestBackgroundPermissionsAsync();
-        if (backgroundStatus !== 'granted') {
-          Alert.alert('Background Location', 'Background location is recommended for continuous tracking');
-        }
-      } catch (error) {
-        console.log('Background location permission skipped:', error.message);
+  const requestAllPermissions = async () => {
+    try {
+      const { status: locationStatus } = await Location.requestForegroundPermissionsAsync();
+      if (locationStatus !== 'granted') {
+        throw new Error('Location permission denied');
       }
-    }
 
-    // Android-specific Wi-Fi permissions with better error handling
-    if (Platform.OS === 'android') {
-      try {
-        // Check Android version and request appropriate permissions
-        const permissions = [
-          'android.permission.ACCESS_FINE_LOCATION',
-          'android.permission.ACCESS_COARSE_LOCATION',
-        ];
-
-        // Only add these if they exist in the current API level
-        if (Platform.Version >= 23) {
-          permissions.push('android.permission.ACCESS_WIFI_STATE');
-        }
-
-        if (Platform.Version >= 29) {
-          permissions.push('android.permission.ACCESS_BACKGROUND_LOCATION');
-        }
-
-        const results = {};
-        for (const permission of permissions) {
-          try {
-            const result = await PermissionsAndroid.request(permission);
-            results[permission] = result;
-          } catch (permError) {
-            console.log(`Permission ${permission} failed:`, permError.message);
-            results[permission] = PermissionsAndroid.RESULTS.DENIED;
+      if (Platform.OS === 'android') {
+        try {
+          const { status: backgroundStatus } = await Location.requestBackgroundPermissionsAsync();
+          if (backgroundStatus !== 'granted') {
+            Alert.alert('Background Location', 'Background location is recommended for continuous tracking');
           }
+        } catch (error) {
+          console.log('Background location permission skipped:', error.message);
         }
-
-        const hasLocationPermission = 
-          results['android.permission.ACCESS_FINE_LOCATION'] === PermissionsAndroid.RESULTS.GRANTED ||
-          results['android.permission.ACCESS_COARSE_LOCATION'] === PermissionsAndroid.RESULTS.GRANTED;
-
-        if (hasLocationPermission) {
-          setWifiScanningEnabled(true);
-          console.log('Wi-Fi scanning enabled');
-        } else {
-          Alert.alert('Location Required', 'Location permission is required for Wi-Fi scanning');
-          setWifiScanningEnabled(false);
-        }
-
-      } catch (androidError) {
-        console.log('Android permission error:', androidError.message);
-        // Still try to enable Wi-Fi scanning - permissions might already be granted
-        setWifiScanningEnabled(true);
       }
-    } else {
-      // iOS - limited Wi-Fi scanning
-      setWifiScanningEnabled(false);
-      Alert.alert('iOS Limitation', 'iOS only provides limited Wi-Fi information');
-    }
 
-  } catch (error) {
-    console.error('Permission request error:', error);
-    // Don't throw - continue with limited functionality
-    Alert.alert('Permission Error', `Some permissions failed: ${error.message}`);
-  }
-};
+      if (Platform.OS === 'android') {
+        try {
+          const permissions = [
+            'android.permission.ACCESS_FINE_LOCATION',
+            'android.permission.ACCESS_COARSE_LOCATION',
+          ];
+
+          if (Platform.Version >= 23) {
+            permissions.push('android.permission.ACCESS_WIFI_STATE');
+          }
+
+          if (Platform.Version >= 29) {
+            permissions.push('android.permission.ACCESS_BACKGROUND_LOCATION');
+          }
+
+          const results = {};
+          for (const permission of permissions) {
+            try {
+              const result = await PermissionsAndroid.request(permission);
+              results[permission] = result;
+            } catch (permError) {
+              console.log(`Permission ${permission} failed:`, permError.message);
+              results[permission] = PermissionsAndroid.RESULTS.DENIED;
+            }
+          }
+
+          const hasLocationPermission = 
+            results['android.permission.ACCESS_FINE_LOCATION'] === PermissionsAndroid.RESULTS.GRANTED ||
+            results['android.permission.ACCESS_COARSE_LOCATION'] === PermissionsAndroid.RESULTS.GRANTED;
+
+          if (hasLocationPermission) {
+            setWifiScanningEnabled(true);
+            console.log('Wi-Fi scanning enabled');
+          } else {
+            Alert.alert('Location Required', 'Location permission is required for Wi-Fi scanning');
+            setWifiScanningEnabled(false);
+          }
+
+        } catch (androidError) {
+          console.log('Android permission error:', androidError.message);
+          setWifiScanningEnabled(true);
+        }
+      } else {
+        setWifiScanningEnabled(false);
+        Alert.alert('iOS Limitation', 'iOS only provides limited Wi-Fi information');
+      }
+
+    } catch (error) {
+      console.error('Permission request error:', error);
+      Alert.alert('Permission Error', `Some permissions failed: ${error.message}`);
+    }
+  };
+
   const loadStoredData = async () => {
     try {
       const storedFingerprints = await AsyncStorage.getItem('fingerprint_count');
@@ -203,18 +318,15 @@ const App = () => {
   const startSensorMonitoring = async () => {
     const updateInterval = batteryOptimized ? 2000 : 1000;
 
-    // Magnetometer
     Magnetometer.setUpdateInterval(updateInterval);
     Magnetometer.addListener((data) => {
       setMagnetometer(data);
     });
 
-    // Accelerometer
     Accelerometer.setUpdateInterval(100);
     Accelerometer.addListener((data) => {
       setAccelerometer(data);
       
-      // Detect movement for battery optimization
       const magnitude = Math.sqrt(data.x * data.x + data.y * data.y + data.z * data.z);
       const isMoving = Math.abs(magnitude - 9.81) > 2;
       
@@ -223,7 +335,6 @@ const App = () => {
       }
     });
 
-    // Gyroscope
     Gyroscope.setUpdateInterval(200);
     Gyroscope.addListener((data) => {
       setGyroscope(data);
@@ -232,65 +343,67 @@ const App = () => {
     console.log('Sensors started');
   };
 
-const scanWiFiNetworks = async () => {
-  if (!wifiScanningEnabled) {
-    console.log('Wi-Fi scanning not enabled');
-    return [];
-  }
+  // ============================================================================
+  // WI-FI AND POSITIONING FUNCTIONS (Enhanced with auth)
+  // ============================================================================
 
-  try {
-    if (Platform.OS === 'android') {
-      console.log('Starting Wi-Fi scan...');
-      
-      // Force a new scan
-      const wifiList = await WifiManager.loadWifiList();
-      console.log(`Raw Wi-Fi scan result: ${wifiList.length} networks`);
-      
-      const networks = wifiList
-        .filter(network => network.BSSID && network.BSSID !== '02:00:00:00:00:00')
-        .map(network => ({
-          ssid: network.SSID || 'Hidden Network',
-          bssid: network.BSSID,
-          level: network.level || -100,
-          frequency: network.frequency || 2400,
-          capabilities: network.capabilities || '',
-          timestamp: Date.now()
-        }));
-
-      console.log(`Filtered networks: ${networks.length}`);
-      console.log('Network details:', networks.slice(0, 3)); // Log first 3 for debugging
-      
-      setLastWifiScan(new Date());
-      return networks;
-      
-    } else {
-      // iOS fallback
-      const netInfo = await NetInfo.fetch();
-      if (netInfo.type === 'wifi' && netInfo.details) {
-        const connectedNetwork = {
-          ssid: netInfo.details.ssid || 'Connected Network',
-          bssid: 'ios-connected-network',
-          level: -50,
-          frequency: 2400,
-          isConnected: true,
-          timestamp: Date.now()
-        };
-        return [connectedNetwork];
-      }
+  const scanWiFiNetworks = async () => {
+    if (!wifiScanningEnabled) {
+      console.log('Wi-Fi scanning not enabled');
       return [];
     }
-  } catch (error) {
-    console.error('Wi-Fi scan error:', error);
-    
-    if (error.message.includes('location')) {
-      Alert.alert('Location Required', 'Wi-Fi scanning requires location permission and enabled location services');
-    } else if (error.message.includes('wifi')) {
-      Alert.alert('Wi-Fi Error', 'Please ensure Wi-Fi is enabled');
+
+    try {
+      if (Platform.OS === 'android') {
+        console.log('Starting Wi-Fi scan...');
+        
+        const wifiList = await WifiManager.loadWifiList();
+        console.log(`Raw Wi-Fi scan result: ${wifiList.length} networks`);
+        
+        const networks = wifiList
+          .filter(network => network.BSSID && network.BSSID !== '02:00:00:00:00:00')
+          .map(network => ({
+            ssid: network.SSID || 'Hidden Network',
+            bssid: network.BSSID,
+            level: network.level || -100,
+            frequency: network.frequency || 2400,
+            capabilities: network.capabilities || '',
+            timestamp: Date.now()
+          }));
+
+        console.log(`Filtered networks: ${networks.length}`);
+        console.log('Network details:', networks.slice(0, 3));
+        
+        setLastWifiScan(new Date());
+        return networks;
+        
+      } else {
+        const netInfo = await NetInfo.fetch();
+        if (netInfo.type === 'wifi' && netInfo.details) {
+          const connectedNetwork = {
+            ssid: netInfo.details.ssid || 'Connected Network',
+            bssid: 'ios-connected-network',
+            level: -50,
+            frequency: 2400,
+            isConnected: true,
+            timestamp: Date.now()
+          };
+          return [connectedNetwork];
+        }
+        return [];
+      }
+    } catch (error) {
+      console.error('Wi-Fi scan error:', error);
+      
+      if (error.message.includes('location')) {
+        Alert.alert('Location Required', 'Wi-Fi scanning requires location permission and enabled location services');
+      } else if (error.message.includes('wifi')) {
+        Alert.alert('Wi-Fi Error', 'Please ensure Wi-Fi is enabled');
+      }
+      
+      return [];
     }
-    
-    return [];
-  }
-};
+  };
 
   const updateCurrentLocation = async () => {
     try {
@@ -302,7 +415,6 @@ const scanWiFiNetworks = async () => {
       
       setCurrentLocation(location);
       
-      // Determine indoor/outdoor based on GPS accuracy
       const gpsAccuracy = location.coords.accuracy;
       const isLikelyOutdoor = gpsAccuracy < 15;
       const isLikelyIndoor = gpsAccuracy > 25;
@@ -316,7 +428,6 @@ const scanWiFiNetworks = async () => {
         setIsIndoor(true);
         await performIndoorPositioning();
       } else {
-        // Transition zone
         setPositioningMethod('Hybrid');
         await performIndoorPositioning();
       }
@@ -336,7 +447,6 @@ const scanWiFiNetworks = async () => {
 
   const performIndoorPositioning = async () => {
     try {
-      // Scan Wi-Fi networks
       const wifiData = await scanWiFiNetworks();
       setWifiNetworks(wifiData);
       
@@ -347,7 +457,6 @@ const scanWiFiNetworks = async () => {
         return;
       }
 
-      // Get position estimate from server or local algorithm
       const estimatedPosition = await estimateIndoorPosition(wifiData, magnetometer);
       
       setCurrentArea(estimatedPosition.area);
@@ -365,23 +474,17 @@ const scanWiFiNetworks = async () => {
 
   const estimateIndoorPosition = async (wifiData, magneticData) => {
     try {
-      // Try server-based positioning first
-      const response = await fetch(`${API_BASE_URL}/estimate-position`, {
+      const response = await apiRequest('/estimate-position', {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer your-token-here' // Add authentication
-        },
         body: JSON.stringify({
           wifi_networks: wifiData,
           magnetometer_data: magneticData,
           accelerometer_data: accelerometer,
           timestamp: new Date().toISOString()
         }),
-        timeout: 8000
       });
 
-      if (response.ok) {
+      if (response && response.ok) {
         const result = await response.json();
         console.log('Server positioning result:', result);
         return {
@@ -396,7 +499,6 @@ const scanWiFiNetworks = async () => {
       console.log('Network error, using local positioning:', error.message);
     }
 
-    // Fallback to local positioning
     return performLocalPositioning(wifiData);
   };
 
@@ -405,18 +507,15 @@ const scanWiFiNetworks = async () => {
       return { area: 'Unknown', confidence: 0, method: 'local' };
     }
 
-    // Sort networks by signal strength
     const sortedNetworks = wifiData.sort((a, b) => b.level - a.level);
     const strongestSignal = sortedNetworks[0];
     
     let estimatedArea = 'Unknown';
     let confidence = 0;
 
-    // Enhanced area detection logic
     const signalStrength = strongestSignal.level;
     const networkCount = wifiData.length;
     
-    // Use signal strength and network density for area estimation
     if (signalStrength > -40 && networkCount >= 3) {
       estimatedArea = 'Main Office Area';
       confidence = 85;
@@ -431,7 +530,6 @@ const scanWiFiNetworks = async () => {
       confidence = 30;
     }
 
-    // Adjust confidence based on network count and signal consistency
     const signalVariance = calculateSignalVariance(wifiData);
     confidence = Math.max(0, confidence - signalVariance);
 
@@ -452,13 +550,17 @@ const scanWiFiNetworks = async () => {
     const mean = levels.reduce((a, b) => a + b) / levels.length;
     const variance = levels.reduce((acc, level) => acc + Math.pow(level - mean, 2), 0) / levels.length;
     
-    return Math.min(30, variance / 10); // Cap at 30% confidence reduction
+    return Math.min(30, variance / 10);
   };
+
+  // ============================================================================
+  // TRACKING FUNCTIONS (Enhanced with auth)
+  // ============================================================================
 
   const startContinuousTracking = () => {
     if (trackingInterval.current) return;
     
-    const interval = batteryOptimized ? 15000 : 8000; // 15s or 8s intervals
+    const interval = batteryOptimized ? 15000 : 8000;
     
     console.log(`Starting continuous tracking with ${interval}ms interval`);
     
@@ -469,7 +571,6 @@ const scanWiFiNetworks = async () => {
       }
     }, interval);
 
-    // Start Wi-Fi scanning interval
     if (wifiScanningEnabled) {
       const wifiInterval = batteryOptimized ? 20000 : 10000;
       wifiScanInterval.current = setInterval(async () => {
@@ -497,7 +598,6 @@ const scanWiFiNetworks = async () => {
   const sendPositionUpdate = async () => {
     try {
       const positionData = {
-        user_id: await AsyncStorage.getItem('user_id') || 'cleaner_001',
         position: {
           coords: currentLocation?.coords || {},
           area: currentArea,
@@ -510,25 +610,22 @@ const scanWiFiNetworks = async () => {
         wifi_networks_count: wifiNetworks.length,
         device_info: {
           platform: Platform.OS,
-          version: Platform.Version
+          version: Platform.Version,
+          user_id: user?.user_id
         }
       };
 
-      const response = await fetch(`${API_BASE_URL}/positions`, {
+      const response = await apiRequest('/positions', {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer your-token-here'
-        },
         body: JSON.stringify(positionData),
-        timeout: 10000
       });
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+      if (response && response.ok) {
+        console.log('Position update sent successfully');
+      } else {
+        throw new Error(`HTTP ${response?.status || 'Unknown'}`);
       }
       
-      console.log('Position update sent successfully');
     } catch (error) {
       console.error('Position update failed:', error);
       await storePositionLocally(positionData);
@@ -539,7 +636,7 @@ const scanWiFiNetworks = async () => {
     try {
       const stored = await AsyncStorage.getItem('offline_positions') || '[]';
       const positions = JSON.parse(stored);
-      positions.push(positionData);
+      positions.push({ ...positionData, user_id: user?.user_id });
       
       const recentPositions = positions.slice(-100);
       await AsyncStorage.setItem('offline_positions', JSON.stringify(recentPositions));
@@ -549,79 +646,62 @@ const scanWiFiNetworks = async () => {
     }
   };
 
-const saveFingerprint = async () => {
-  if (!areaLabel.trim()) {
-    Alert.alert('Error', 'Please enter an area label');
-    return;
-  }
+  const saveFingerprint = async () => {
+    if (!areaLabel.trim()) {
+      Alert.alert('Error', 'Please enter an area label');
+      return;
+    }
 
-  setLoading(true);
-  try {
-    // Get fresh Wi-Fi scan
-    const wifiData = await scanWiFiNetworks();
-    setWifiNetworks(wifiData);
-    
-    const fingerprintData = {
-      area_label: areaLabel.trim(),
-      wifi_networks: wifiData,
-      magnetometer_data: magnetometer,
-      accelerometer_data: accelerometer,
-      gyroscope_data: gyroscope,
-      gps_location: currentLocation,
-      timestamp: new Date().toISOString(),
-      is_indoor: isIndoor,
-      device_info: {
-        platform: Platform.OS,
-        wifi_scanning_enabled: wifiScanningEnabled
-      }
-    };
-
-    // TRY server first, fall back to local storage
+    setLoading(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/fingerprints`, {
+      const wifiData = await scanWiFiNetworks();
+      setWifiNetworks(wifiData);
+      
+      const fingerprintData = {
+        area_label: areaLabel.trim(),
+        wifi_networks: wifiData,
+        magnetometer_data: magnetometer,
+        accelerometer_data: accelerometer,
+        gyroscope_data: gyroscope,
+        gps_location: currentLocation,
+        timestamp: new Date().toISOString(),
+        is_indoor: isIndoor,
+        device_info: {
+          platform: Platform.OS,
+          wifi_scanning_enabled: wifiScanningEnabled,
+          user_id: user?.user_id
+        }
+      };
+
+      const response = await apiRequest('/fingerprints', {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-        },
         body: JSON.stringify(fingerprintData),
-        timeout: 5000
       });
 
-      if (response.ok) {
+      if (response && response.ok) {
         console.log('Fingerprint saved to server');
+        
+        const newCount = collectedFingerprints + 1;
+        setCollectedFingerprints(newCount);
+        await AsyncStorage.setItem('fingerprint_count', newCount.toString());
+        
+        setLastSaveTime(new Date());
+        Alert.alert(
+          'Success', 
+          `Fingerprint saved for ${areaLabel}!\nWi-Fi networks: ${wifiData.length}\nTotal collected: ${newCount}\n${wifiData.length === 0 ? '⚠️ No networks detected' : '✅ Networks detected'}`
+        );
+        setAreaLabel('');
       } else {
         throw new Error('Server error');
       }
-    } catch (networkError) {
-      console.log('Server unavailable, saving locally:', networkError.message);
-      
-      // Save locally for now
-      const storedData = await AsyncStorage.getItem('fingerprints') || '[]';
-      const fingerprints = JSON.parse(storedData);
-      fingerprints.push(fingerprintData);
-      await AsyncStorage.setItem('fingerprints', JSON.stringify(fingerprints));
-      
-      console.log('Fingerprint saved locally');
+
+    } catch (error) {
+      console.error('Save fingerprint error:', error);
+      Alert.alert('Error', `Failed to save fingerprint: ${error.message}`);
+    } finally {
+      setLoading(false);
     }
-
-    const newCount = collectedFingerprints + 1;
-    setCollectedFingerprints(newCount);
-    await AsyncStorage.setItem('fingerprint_count', newCount.toString());
-    
-    setLastSaveTime(new Date());
-    Alert.alert(
-      'Success', 
-      `Fingerprint saved for ${areaLabel}!\nWi-Fi networks: ${wifiData.length}\nTotal collected: ${newCount}\n${wifiData.length === 0 ? '⚠️ No networks detected' : '✅ Networks detected'}`
-    );
-    setAreaLabel('');
-
-  } catch (error) {
-    console.error('Save fingerprint error:', error);
-    Alert.alert('Error', `Failed to save fingerprint: ${error.message}`);
-  } finally {
-    setLoading(false);
-  }
-};
+  };
 
   const toggleTracking = () => {
     if (!isTracking) {
@@ -660,9 +740,69 @@ const saveFingerprint = async () => {
     }
   }, [mode, isTracking, batteryOptimized]);
 
+  // ============================================================================
+  // RENDER FUNCTIONS
+  // ============================================================================
+
+  const renderLoginScreen = () => (
+    <View style={styles.loginContainer}>
+      <View style={styles.loginCard}>
+        <Text style={styles.loginTitle}>Indoor Positioning System</Text>
+        <Text style={styles.loginSubtitle}>Sign in to continue</Text>
+
+        <TextInput
+          style={styles.loginInput}
+          placeholder="Email"
+          value={loginForm.email}
+          onChangeText={(text) => setLoginForm({...loginForm, email: text})}
+          keyboardType="email-address"
+          autoCapitalize="none"
+          autoComplete="email"
+        />
+
+        <TextInput
+          style={styles.loginInput}
+          placeholder="Password"
+          value={loginForm.password}
+          onChangeText={(text) => setLoginForm({...loginForm, password: text})}
+          secureTextEntry
+          autoComplete="password"
+        />
+
+        <TouchableOpacity 
+          style={[styles.loginButton, isLoginLoading && styles.buttonDisabled]} 
+          onPress={handleLogin}
+          disabled={isLoginLoading}
+        >
+          {isLoginLoading ? (
+            <ActivityIndicator color="white" />
+          ) : (
+            <Text style={styles.loginButtonText}>Sign In</Text>
+          )}
+        </TouchableOpacity>
+
+        <View style={styles.testCredentials}>
+          <Text style={styles.testCredentialsTitle}>Test Credentials:</Text>
+          <Text style={styles.testCredentialsText}>Admin: admin@indoorpositioning.com / admin123</Text>
+          <Text style={styles.testCredentialsText}>Cleaner: maria@company.com / cleaner123</Text>
+        </View>
+      </View>
+    </View>
+  );
+
   const renderStatusCard = () => (
     <View style={styles.card}>
-      <Text style={styles.cardTitle}>System Status</Text>
+      <View style={styles.cardHeader}>
+        <Text style={styles.cardTitle}>System Status</Text>
+        <TouchableOpacity onPress={handleLogout} style={styles.logoutButton}>
+          <Text style={styles.logoutButtonText}>Logout</Text>
+        </TouchableOpacity>
+      </View>
+      
+      <View style={styles.statusRow}>
+        <Text style={styles.statusLabel}>User:</Text>
+        <Text style={styles.statusValue}>{user?.name} ({user?.role})</Text>
+      </View>
       <View style={styles.statusRow}>
         <Text style={styles.statusLabel}>Environment:</Text>
         <Text style={[styles.statusValue, { color: isIndoor ? '#e74c3c' : '#27ae60' }]}>
@@ -682,14 +822,6 @@ const saveFingerprint = async () => {
         </Text>
       </View>
       <View style={styles.statusRow}>
-        <Text style={styles.statusLabel}>Wi-Fi Scanning:</Text>
-        <Text style={[styles.statusValue, { 
-          color: wifiScanningEnabled ? '#27ae60' : '#e74c3c' 
-        }]}>
-          {wifiScanningEnabled ? '✅ Enabled' : '❌ Limited'}
-        </Text>
-      </View>
-      <View style={styles.statusRow}>
         <Text style={styles.statusLabel}>Connection:</Text>
         <Text style={[styles.statusValue, { 
           color: connectionStatus === 'connected' ? '#27ae60' : '#e74c3c' 
@@ -703,20 +835,40 @@ const saveFingerprint = async () => {
           <Text style={styles.statusValue}>{currentLocation.coords.accuracy.toFixed(1)}m</Text>
         </View>
       )}
-      {lastWifiScan && (
-        <View style={styles.statusRow}>
-          <Text style={styles.statusLabel}>Last Wi-Fi Scan:</Text>
-          <Text style={styles.statusValue}>{lastWifiScan.toLocaleTimeString()}</Text>
-        </View>
-      )}
     </View>
   );
+
+  const renderModeSelector = () => {
+    // Only show mode selector for admins
+    if (user?.role !== 'admin') return null;
+
+    return (
+      <View style={styles.modeSelector}>
+        <TouchableOpacity
+          style={[styles.modeButton, mode === 'training' && styles.modeButtonActive]}
+          onPress={() => setMode('training')}
+        >
+          <Text style={[styles.modeButtonText, mode === 'training' && styles.modeButtonTextActive]}>
+            Training
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.modeButton, mode === 'cleaner' && styles.modeButtonActive]}
+          onPress={() => setMode('cleaner')}
+        >
+          <Text style={[styles.modeButtonText, mode === 'cleaner' && styles.modeButtonTextActive]}>
+            Cleaner
+          </Text>
+        </TouchableOpacity>
+      </View>
+    );
+  };
 
   const renderTrainingMode = () => (
     <ScrollView style={styles.container} showsVerticalScrollIndicator={false}>
       <View style={styles.header}>
         <Text style={styles.title}>Training Mode</Text>
-        <Text style={styles.subtitle}>Collect real Wi-Fi fingerprints for indoor positioning</Text>
+        <Text style={styles.subtitle}>Collect Wi-Fi fingerprints for indoor positioning</Text>
       </View>
 
       {loading && (
@@ -736,11 +888,6 @@ const saveFingerprint = async () => {
         {lastSaveTime && (
           <Text style={styles.infoText}>
             Last saved: {lastSaveTime.toLocaleTimeString()}
-          </Text>
-        )}
-        {Platform.OS === 'ios' && (
-          <Text style={styles.warningText}>
-            ⚠️ iOS provides limited Wi-Fi data. Positioning will rely more on other sensors.
           </Text>
         )}
       </View>
@@ -802,19 +949,6 @@ const saveFingerprint = async () => {
             +{wifiNetworks.length - 5} more networks detected
           </Text>
         )}
-      </View>
-
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Sensor Data</Text>
-        <Text style={styles.sensorText}>
-          Magnetometer: X:{magnetometer.x.toFixed(2)} Y:{magnetometer.y.toFixed(2)} Z:{magnetometer.z.toFixed(2)} μT
-        </Text>
-        <Text style={styles.sensorText}>
-          Accelerometer: X:{accelerometer.x.toFixed(2)} Y:{accelerometer.y.toFixed(2)} Z:{accelerometer.z.toFixed(2)} m/s²
-        </Text>
-        <Text style={styles.sensorText}>
-          Gyroscope: X:{gyroscope.x.toFixed(3)} Y:{gyroscope.y.toFixed(3)} Z:{gyroscope.z.toFixed(3)} rad/s
-        </Text>
       </View>
 
       <View style={styles.card}>
@@ -890,49 +1024,6 @@ const saveFingerprint = async () => {
       </View>
 
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Real-time Wi-Fi Environment</Text>
-        {wifiNetworks.length === 0 ? (
-          <View>
-            <Text style={styles.noDataText}>No Wi-Fi networks detected</Text>
-            <TouchableOpacity 
-              style={styles.scanButton} 
-              onPress={performIndoorPositioning}
-            >
-              <Text style={styles.scanButtonText}>Manual Wi-Fi Scan</Text>
-            </TouchableOpacity>
-          </View>
-        ) : (
-          <View>
-            <Text style={styles.infoText}>
-              Networks detected: {wifiNetworks.length} | 
-              Last scan: {lastWifiScan ? lastWifiScan.toLocaleTimeString() : 'Never'}
-            </Text>
-            {wifiNetworks.slice(0, 4).map((network, index) => (
-              <View key={index} style={styles.wifiRow}>
-                <View style={styles.wifiInfo}>
-                  <Text style={styles.wifiSSID}>{network.ssid}</Text>
-                  <Text style={styles.wifiBSSID}>{network.bssid}</Text>
-                </View>
-                <View style={styles.wifiSignalContainer}>
-                  <Text style={[styles.wifiSignal, {
-                    color: network.level > -50 ? '#27ae60' : network.level > -70 ? '#f39c12' : '#e74c3c'
-                  }]}>
-                    {network.level}dBm
-                  </Text>
-                  <Text style={styles.wifiFreq}>{network.frequency}MHz</Text>
-                </View>
-              </View>
-            ))}
-            {wifiNetworks.length > 4 && (
-              <Text style={styles.moreNetworksText}>
-                +{wifiNetworks.length - 4} more networks
-              </Text>
-            )}
-          </View>
-        )}
-      </View>
-
-      <View style={styles.card}>
         <Text style={styles.cardTitle}>Settings</Text>
         <View style={styles.settingRow}>
           <Text style={styles.settingLabel}>Battery Optimization</Text>
@@ -948,18 +1039,25 @@ const saveFingerprint = async () => {
           }
         </Text>
       </View>
-
-      {Platform.OS === 'ios' && (
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>iOS Limitations</Text>
-          <Text style={styles.warningText}>
-            ⚠️ iOS only provides connected Wi-Fi network information. 
-            For better indoor positioning, consider using Android devices.
-          </Text>
-        </View>
-      )}
     </ScrollView>
   );
+
+  // ============================================================================
+  // MAIN RENDER
+  // ============================================================================
+
+  if (isLoading) {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color="#007AFF" />
+        <Text style={styles.loadingText}>Loading...</Text>
+      </View>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return renderLoginScreen();
+  }
 
   if (loading) {
     return (
@@ -973,29 +1071,15 @@ const saveFingerprint = async () => {
 
   return (
     <View style={styles.app}>
-      <View style={styles.modeSelector}>
-        <TouchableOpacity
-          style={[styles.modeButton, mode === 'training' && styles.modeButtonActive]}
-          onPress={() => setMode('training')}
-        >
-          <Text style={[styles.modeButtonText, mode === 'training' && styles.modeButtonTextActive]}>
-            Training
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.modeButton, mode === 'cleaner' && styles.modeButtonActive]}
-          onPress={() => setMode('cleaner')}
-        >
-          <Text style={[styles.modeButtonText, mode === 'cleaner' && styles.modeButtonTextActive]}>
-            Cleaner
-          </Text>
-        </TouchableOpacity>
-      </View>
-
+      {renderModeSelector()}
       {mode === 'training' ? renderTrainingMode() : renderCleanerMode()}
     </View>
   );
 };
+
+// ============================================================================
+// STYLES
+// ============================================================================
 
 const styles = StyleSheet.create({
   app: {
@@ -1007,18 +1091,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     backgroundColor: '#f8f9fa',
-  },
-  loadingCard: {
-    backgroundColor: 'white',
-    borderRadius: 12,
-    padding: 20,
-    marginBottom: 16,
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 3.84,
-    elevation: 5,
   },
   loadingText: {
     fontSize: 18,
@@ -1033,6 +1105,79 @@ const styles = StyleSheet.create({
     marginTop: 8,
     textAlign: 'center',
   },
+  // Login Styles
+  loginContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#f8f9fa',
+    padding: 20,
+  },
+  loginCard: {
+    backgroundColor: 'white',
+    borderRadius: 20,
+    padding: 30,
+    width: '100%',
+    maxWidth: 400,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  loginTitle: {
+    fontSize: 28,
+    fontWeight: 'bold',
+    color: '#2c3e50',
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  loginSubtitle: {
+    fontSize: 16,
+    color: '#7f8c8d',
+    textAlign: 'center',
+    marginBottom: 30,
+  },
+  loginInput: {
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 12,
+    padding: 16,
+    fontSize: 16,
+    marginBottom: 16,
+    backgroundColor: '#f8f9fa',
+  },
+  loginButton: {
+    backgroundColor: '#007AFF',
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  loginButtonText: {
+    color: 'white',
+    fontSize: 18,
+    fontWeight: '600',
+  },
+  testCredentials: {
+    marginTop: 20,
+    padding: 16,
+    backgroundColor: '#f8f9fa',
+    borderRadius: 8,
+  },
+  testCredentialsTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#2c3e50',
+    marginBottom: 8,
+  },
+  testCredentialsText: {
+    fontSize: 12,
+    color: '#7f8c8d',
+    marginBottom: 4,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  // Mode Selector Styles
   modeSelector: {
     flexDirection: 'row',
     backgroundColor: 'white',
@@ -1063,6 +1208,7 @@ const styles = StyleSheet.create({
   modeButtonTextActive: {
     color: 'white',
   },
+  // Main App Styles
   container: {
     flex: 1,
     padding: 20,
@@ -1091,11 +1237,28 @@ const styles = StyleSheet.create({
     shadowRadius: 3.84,
     elevation: 5,
   },
+  cardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
   cardTitle: {
     fontSize: 18,
     fontWeight: '600',
     color: '#2c3e50',
-    marginBottom: 12,
+    flex: 1,
+  },
+  logoutButton: {
+    backgroundColor: '#e74c3c',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+  },
+  logoutButtonText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: '600',
   },
   statusRow: {
     flexDirection: 'row',
@@ -1112,19 +1275,14 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: '#2c3e50',
+    flex: 1,
+    textAlign: 'right',
   },
   progressText: {
     fontSize: 18,
     fontWeight: '600',
     color: '#27ae60',
     marginBottom: 8,
-  },
-  warningText: {
-    fontSize: 12,
-    color: '#e67e22',
-    fontStyle: 'italic',
-    marginTop: 8,
-    lineHeight: 16,
   },
   input: {
     borderWidth: 1,
@@ -1148,18 +1306,6 @@ const styles = StyleSheet.create({
     color: 'white',
     fontSize: 16,
     fontWeight: '600',
-  },
-  scanButton: {
-    backgroundColor: '#3498db',
-    borderRadius: 6,
-    padding: 12,
-    alignItems: 'center',
-    marginTop: 8,
-  },
-  scanButtonText: {
-    color: 'white',
-    fontSize: 14,
-    fontWeight: '500',
   },
   scanInfo: {
     fontSize: 12,
@@ -1211,12 +1357,6 @@ const styles = StyleSheet.create({
     color: '#95a5a6',
     textAlign: 'center',
     marginVertical: 16,
-  },
-  sensorText: {
-    fontSize: 12,
-    color: '#7f8c8d',
-    marginBottom: 4,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
   wifiRow: {
     flexDirection: 'row',
@@ -1275,6 +1415,18 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#95a5a6',
     fontStyle: 'italic',
+  },
+  loadingCard: {
+    backgroundColor: 'white',
+    borderRadius: 12,
+    padding: 20,
+    marginBottom: 16,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 3.84,
+    elevation: 5,
   },
 });
 
