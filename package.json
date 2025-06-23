@@ -21,6 +21,7 @@
     "react": "19.0.0",
     "react-native": "0.79.3",
     "react-native-keep-awake": "^4.0.0",
+    "react-native-sensors": "^7.3.6",
     "react-native-wifi-reborn": "^4.13.5"
   },
   "devDependencies": {
