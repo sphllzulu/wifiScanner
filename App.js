@@ -1302,6 +1302,7 @@ import { Magnetometer, Accelerometer, Gyroscope } from 'expo-sensors';
 import NetInfo from '@react-native-community/netinfo';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import WifiManager from 'react-native-wifi-reborn';
+import EnhancedLocationSystem from './EnhancedLocation';
 
 const API_BASE_URL = 'https://sanitapi-1.onrender.com/api';
 
@@ -1344,6 +1345,19 @@ const App = () => {
   const [confidence, setConfidence] = useState(0);
   const [positioningMethod, setPositioningMethod] = useState('unknown');
   const [wifiScanningEnabled, setWifiScanningEnabled] = useState(true);
+
+  // Enhanced location
+  const [enhancedLocationData, setEnhancedLocationData] = useState({
+  area: 'Unknown',
+  coordinates: null,
+  confidence: 0,
+  method: 'initializing',
+  timestamp: null,
+  sensors_used: [],
+  movement_detected: false
+});
+
+const [enhancedSystemReady, setEnhancedSystemReady] = useState(false);
 
   // Tracking state
   const [collectedFingerprints, setCollectedFingerprints] = useState(0);
@@ -1666,21 +1680,28 @@ const App = () => {
     return () => subscription?.remove();
   };
 
-  const initializeApp = async () => {
-    try {
-      setLoading(true);
-      await requestAllPermissions();
-      await startSensorMonitoring();
-      await updateCurrentLocation();
-      await loadStoredData();
-      console.log('App initialized successfully');
-    } catch (error) {
-      console.error('Initialization error:', error);
-      Alert.alert('Setup Error', `Failed to initialize: ${error.message}`);
-    } finally {
-      setLoading(false);
+// REPLACE the entire initializeApp function with this:
+const initializeApp = async () => {
+  try {
+    setLoading(true);
+    // Basic location permission (Enhanced system handles the rest)
+    const { status: locationStatus } = await Location.requestForegroundPermissionsAsync();
+    if (locationStatus !== 'granted') {
+      Alert.alert('Permission Required', 'Location permission is required for positioning');
+      return;
     }
-  };
+    
+    // Let Enhanced Location System handle sensor initialization
+    setEnhancedSystemReady(true);
+    await loadStoredData();
+    console.log('App initialized with Enhanced Location System');
+  } catch (error) {
+    console.error('Initialization error:', error);
+    Alert.alert('Setup Error', `Failed to initialize: ${error.message}`);
+  } finally {
+    setLoading(false);
+  }
+};
 
   const requestAllPermissions = async () => {
     try {
